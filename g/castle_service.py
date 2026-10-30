@@ -322,10 +322,18 @@ def mint_castle_from_browser(
     *,
     timeout_s: int = 70,
     headless: Optional[bool] = None,
+    proxy: Optional[dict[str, Any]] = None,
+    user_agent: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Open accounts.x.ai/sign-up in real Chrome, mint via page CastleProvider.
     Rejects short/npm-style tokens (invalid_token on server).
+
+    proxy: Playwright proxy dict ({"server": "http://host:port", ...})，必须与
+        后续 curl_cffi 走同一出口，否则服务端会把发码判成「换会话」而静默丢弃。
+    user_agent: 覆盖 UA（无头 Chrome 默认 UA 带 HeadlessChrome，会被 CF 拦）。
+    返回结果额外带 cookies / user_agent：发码接口要求 Castle token 与页面
+    会话 cookie 同时存在，HTTP 侧要复用这份 cookie。
     """
     global _LAST_ERR, _LAST_MINT_TS
     conversion_id = new_conversion_id()
@@ -338,6 +346,8 @@ def mint_castle_from_browser(
         "elapsed_s": 0.0,
         "castle_len": 0,
         "min_len": MIN_CASTLE_LEN,
+        "cookies": {},
+        "user_agent": "",
         "debug": {},
     }
     if headless is None:
@@ -367,7 +377,7 @@ def mint_castle_from_browser(
             ]
             if headless:
                 args.append("--headless=new")
-            ctx = p.chromium.launch_persistent_context(
+            launch_kwargs: dict[str, Any] = dict(
                 user_data_dir=str(profile),
                 channel="chrome",
                 headless=bool(headless),
@@ -376,10 +386,23 @@ def mint_castle_from_browser(
                 timezone_id="America/New_York",
                 args=args,
             )
+            if user_agent:
+                launch_kwargs["user_agent"] = user_agent
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+            try:
+                ctx = p.chromium.launch_persistent_context(**launch_kwargs)
+            except Exception as launch_err:
+                # 没装 Chrome 时退回 Playwright 自带 chromium，别整条链路直接失败
+                out["debug"]["channel_fallback"] = str(launch_err)[:160]
+                launch_kwargs.pop("channel", None)
+                ctx = p.chromium.launch_persistent_context(**launch_kwargs)
             try:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    "Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});"
+                    "window.chrome = window.chrome || {runtime: {}};"
                 )
                 nav_timeout = min(90000, max(30000, int(timeout_s) * 1000))
                 page.goto(
@@ -477,8 +500,26 @@ def mint_castle_from_browser(
                     out["error"] = err or "castle mint failed (no usable token)"
                 _LAST_ERR = out["error"]
             finally:
+                # 发码接口把 Castle token 和页面会话绑定：必须带回 cookie/UA
+                try:
+                    out["cookies"] = {c["name"]: c["value"] for c in ctx.cookies()}
+                except Exception:
+                    out["cookies"] = {}
+                try:
+                    ua_now = page.evaluate("() => navigator.userAgent")
+                    if ua_now:
+                        out["user_agent"] = str(ua_now)
+                except Exception:
+                    out["user_agent"] = user_agent or ""
                 try:
                     ctx.close()
+                except Exception:
+                    pass
+                # 每号一次 mint 会留下一个 user-data-dir，及时清掉防止 logs 膨胀
+                try:
+                    import shutil as _shutil
+
+                    _shutil.rmtree(str(profile), ignore_errors=True)
                 except Exception:
                     pass
     except Exception as e:

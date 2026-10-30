@@ -80,9 +80,34 @@ DEVICE_FLOW_ISSUE_TOKEN = os.environ.get("GROK_DEVICE_FLOW_ISSUE_TOKEN", "1").st
 # Action ID 缓存：页面发版后 id 会变，过长缓存会让注册 server action 打空
 _ACTION_CACHE_TTL = int(os.environ.get("GROK_ACTION_CACHE_TTL", str(30 * 60)))  # 默认 30 分钟
 
+# x.ai 2026-10 起把「发码/验码」从 grpc-web 迁到 REST JSON：
+#   POST /api/auth/send-verification-code  {email, castleRequestToken}
+#   POST /api/auth/sign-up/verify-email    {email, code}
+# 旧 grpc-web 端点（auth_mgmt.AuthManagement.CreateEmailValidationCode）还在，
+# 但会返回 grpc-status:0 却**不再真的发信**——这正是「协议发码收不到邮箱」的根因。
+# 新接口要求 castle token 与页面的会话 cookie（gb_anon_id / xai_anon_id / cf_clearance…）
+# 成对出现，所以协议模式需要先用浏览器 mint castle，再把 cookie 灌回 HTTP 会话。
+AUTH_CODE_SEND_PATH = "/api/auth/send-verification-code"
+AUTH_CODE_VERIFY_PATH = "/api/auth/sign-up/verify-email"
+_DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def send_code_castle_enabled() -> bool:
+    """发码是否先用浏览器 mint Castle（默认开；GROK_SEND_CODE_CASTLE=0 可关）。
+
+    运行时读取环境变量：app.py 先 import grok 再 load_dotenv，
+    模块级常量会读不到 .env 里的值。
+    """
+    raw = (os.environ.get("GROK_SEND_CODE_CASTLE") or "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
 # 注册路径：
-#   same_session = 同页 castle mint + 页内 fetch（CLEAN 主路径，默认）
-#   protocol     = 旧混合协议（Camoufox 拆会话 mint + curl signup，易 CASTLE deny）
+#   protocol     = 协议主路径：REST /api/auth/* 发码/验码/注册
+#                  （发码前用无头浏览器 mint Castle 并把页面 cookie 同步进会话）
+#   same_session = 同页 castle mint + 页内 fetch（发码/验码同样走新 REST 接口）
 _REGISTER_MODE_DEFAULT = "protocol"
 _VALID_REGISTER_MODES = ("same_session", "protocol", "legacy", "hybrid")
 
@@ -2210,7 +2235,10 @@ class RegisterEngine:
             )
             return True
 
-        self.log("路径=protocol（旧混合协议，拆会话 castle 易 deny）", "warn")
+        self.log(
+            "路径=protocol（REST 发码/验码/注册 + 无头浏览器 mint Castle）",
+            "info",
+        )
         # 优先用缓存，启动几乎立刻进入注册
         if not force_rescan and self._apply_action_cache():
             aid = self.config["action_id"] or ""
@@ -2359,6 +2387,244 @@ class RegisterEngine:
         except Exception as e:
             self.log(f"{email} 验证验证码异常: {e}", "error")
             return False
+
+    # ---------- 新 REST 认证接口（2026-10 起，发码/验码）----------
+    def _auth_api_headers(self, user_agent: Optional[str] = None) -> dict:
+        headers = {
+            "content-type": "application/json",
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": self.site_url,
+            "referer": f"{self.site_url}/sign-up",
+        }
+        if user_agent:
+            headers["user-agent"] = user_agent
+        return headers
+
+    @staticmethod
+    def _apply_browser_session(session, cookies: Optional[dict]) -> int:
+        """把浏览器 cookie 灌进 curl_cffi 会话：新发码接口要求与 Castle mint 同会话。"""
+        n = 0
+        for name, value in (cookies or {}).items():
+            if not name or value is None:
+                continue
+            try:
+                session.cookies.set(str(name), str(value), domain="accounts.x.ai")
+                n += 1
+            except Exception:
+                continue
+        return n
+
+    def _friendly_api_error(self, code: str, raw: str = "") -> str:
+        """把新 REST 接口的 error code 转成面向用户的提示。"""
+        c = (code or "").strip().lower()
+        if "email-signup-unavailable" in c:
+            return (
+                "服务端判定当前出口/会话不能邮箱注册"
+                "（account:email-signup-unavailable），请更换代理出口后重试"
+            )
+        if "disposable" in c or "domain-rejected" in c or "domain-pending" in c:
+            return "该邮箱域名被 x.ai 拒绝（一次性邮箱 / 域名未验证），请更换邮箱域名"
+        if "rate" in c:
+            return "发码被限流（同一邮箱或出口请求过于频繁），稍后或换邮箱重试"
+        if "castle" in c:
+            return "浏览器校验（Castle）未通过，请重试"
+        if "malformed" in c or "invalid-email" in c:
+            return "邮箱格式不被接受"
+        if "in-use" in c or "existing-email" in c:
+            return "该邮箱已注册，请更换邮箱"
+        return raw or (f"服务端拒绝：{code}" if code else "服务端拒绝（未知原因）")
+
+    def send_email_code_api(
+        self,
+        session,
+        email,
+        castle_request_token: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ):
+        """新 JSON 发码接口。
+
+        返回 (ok, reason)；返回 None 表示接口不存在（旧部署），调用方应回退 grpc。
+        """
+        url = f"{self.site_url}{AUTH_CODE_SEND_PATH}"
+        payload: dict = {"email": email}
+        if castle_request_token:
+            payload["castleRequestToken"] = castle_request_token
+        try:
+            res = session.post(
+                url,
+                json=payload,
+                headers=self._auth_api_headers(user_agent),
+                timeout=20,
+            )
+        except Exception as e:
+            return False, f"网络/请求异常: {e}"
+        if res.status_code in (404, 405):
+            return None
+        data: dict = {}
+        try:
+            data = res.json() or {}
+        except Exception:
+            data = {}
+        if res.status_code == 200:
+            if data.get("ok") or not data:
+                return True, ""
+            code = str(data.get("code") or "")
+            if not code:
+                return True, ""
+            return False, self._friendly_api_error(code, str(data.get("error") or ""))
+        code = str(data.get("code") or "")
+        return False, self._friendly_api_error(
+            code, str(data.get("error") or (res.text or "")[:160])
+        )
+
+    def verify_email_code_api(
+        self,
+        session,
+        email,
+        code: str,
+        user_agent: Optional[str] = None,
+    ):
+        """新 JSON 验码接口；返回 None 表示接口不存在，应回退 grpc。"""
+        url = f"{self.site_url}{AUTH_CODE_VERIFY_PATH}"
+        headers = self._auth_api_headers(user_agent)
+        try:
+            res = session.post(
+                url, json={"email": email, "code": code}, headers=headers, timeout=20
+            )
+        except Exception as e:
+            return False, f"网络/请求异常: {e}"
+        if res.status_code in (404, 405):
+            return None
+        data: dict = {}
+        try:
+            data = res.json() or {}
+        except Exception:
+            data = {}
+        if res.status_code == 200 and (data.get("ok") or not data):
+            return True, ""
+        code_name = str(data.get("code") or "")
+        low = code_name.lower()
+        if "invalid" in low or "expired" in low:
+            return False, "验证码无效或已过期"
+        return False, self._friendly_api_error(code_name, str(data.get("error") or ""))
+
+    @staticmethod
+    def _browser_proxy() -> Optional[dict]:
+        """注册代理 → Playwright proxy dict（浏览器必须与 curl 同出口）。"""
+        try:
+            proxies = _configured_curl_proxies()
+            spec = str(proxies.get("https") or proxies.get("http") or "").strip()
+        except Exception:
+            spec = ""
+        if not spec:
+            return None
+        try:
+            pw_proxy = parse_proxy_spec(spec)
+        except Exception:
+            pw_proxy = None
+        return pw_proxy or {"server": spec}
+
+    def _mint_send_code_castle(self):
+        """发码前：无头浏览器 mint Castle，并带回同会话 cookie / UA。
+
+        返回 (castle_token, cookies, user_agent)；失败时 token 为 None。
+        """
+        if not send_code_castle_enabled():
+            return None, {}, ""
+        try:
+            from g.castle_service import mint_castle_from_browser
+        except Exception as e:  # pragma: no cover
+            self.log(f"Castle 模块不可用: {e}", "warn")
+            return None, {}, ""
+        pw_proxy = self._browser_proxy()
+        t0 = time.time()
+        try:
+            r = mint_castle_from_browser(proxy=pw_proxy, user_agent=_DEFAULT_BROWSER_UA)
+        except Exception as e:
+            self.log(f"Castle mint 异常: {e}", "warn")
+            return None, {}, ""
+        cost = time.time() - t0
+        tok = (r or {}).get("castle") or None
+        cookies = dict((r or {}).get("cookies") or {})
+        ua = str((r or {}).get("user_agent") or _DEFAULT_BROWSER_UA)
+        if tok:
+            self.log(
+                f"Castle OK len={len(tok)} · cookie {len(cookies)} 条 · {cost:.1f}s",
+                "info",
+            )
+        else:
+            self.log(
+                f"Castle mint 失败：{(r or {}).get('error') or 'unknown'}（{cost:.1f}s）",
+                "warn",
+            )
+        return tok, cookies, ua
+
+    def signup_create_account_api(
+        self,
+        session,
+        *,
+        email: str,
+        password: str,
+        email_validation_code: str,
+        turnstile_token: str,
+        castle_request_token: Optional[str] = None,
+        given_name: str = "",
+        family_name: str = "",
+        marketing_opt_in: bool = False,
+        user_agent: Optional[str] = None,
+    ):
+        """新 JSON 注册端点 /api/auth/sign-up/create-account（2026-10 起）。
+
+        返回 (ok, reason, data)；返回 None 表示端点不存在（旧部署），应回退 RSC。
+        """
+        url = f"{self.site_url}/api/auth/sign-up/create-account"
+        payload = {
+            "email": email,
+            "password": password,
+            "givenName": given_name or generate_random_name(),
+            "familyName": family_name or generate_random_name(),
+            "emailValidationCode": re.sub(r"\D", "", str(email_validation_code or "")),
+            "turnstileToken": turnstile_token,
+            "marketingEmailOptIn": bool(marketing_opt_in),
+        }
+        if castle_request_token:
+            payload["castleRequestToken"] = castle_request_token
+        try:
+            res = session.post(
+                url,
+                json=payload,
+                headers=self._auth_api_headers(user_agent),
+                timeout=30,
+            )
+        except Exception as e:
+            return False, f"网络/请求异常: {e}", {}
+        if res.status_code in (404, 405):
+            return None
+        data: dict = {}
+        try:
+            data = res.json() or {}
+        except Exception:
+            data = {}
+        if res.status_code == 200 and not data.get("error"):
+            return True, "", data
+        code = str(data.get("code") or "")
+        low = code.lower()
+        if "existing" in low:
+            return False, "该邮箱已注册（account:existing-email）", data
+        if "castle" in low:
+            return False, "Castle 校验失败（token 过期或与当前会话不匹配）", data
+        if "validation-code" in low or "invalid-validation" in low:
+            return False, "邮箱验证码无效或已过期", data
+        if "turnstile" in low:
+            return False, "Turnstile 校验失败，请重试", data
+        if "password" in low:
+            return False, "密码不符合要求", data
+        return (
+            False,
+            self._friendly_api_error(code, str(data.get("error") or (res.text or "")[:160])),
+            data,
+        )
 
     def _sleep(self, seconds: float) -> bool:
         """可中断 sleep。返回 True 表示已被 stop。"""
@@ -3618,12 +3884,33 @@ class RegisterEngine:
 
                     self.log(f"开始注册: {email}", "info")
 
-                    # 架构：发码/验码/注册 = 纯协议；Turnstile = Camoufox 无头 Solver
-                    # Castle 产线 G6 尚未纯协议还原，默认 Camoufox 无头 mint（CASTLE_MODE=skip 可关）
-                    castle_token = None
-                    if castle_service.mode not in ("skip", "none", "off", "0", "false"):
+                    # 架构：发码/验码/注册 = 协议；Turnstile = Camoufox 无头 Solver
+                    # 发码：x.ai 已迁到 REST /api/auth/send-verification-code，
+                    # 该接口要求 Castle token 与页面会话 cookie 成对出现，
+                    # 缺失时旧 grpc 端点仍回 grpc-status:0 但**不会真的发信**。
+                    # 因此这里先用无头浏览器 mint Castle + 取 cookie，再走 JSON 发码。
+                    castle_token, browser_cookies, browser_ua = None, {}, ""
+                    if send_code_castle_enabled():
+                        self.log(f"{email} 启动无头浏览器 mint Castle（发码必需）…", "info")
+                        castle_token, browser_cookies, browser_ua = (
+                            self._mint_send_code_castle()
+                        )
+                        if browser_cookies:
+                            cookie_n = self._apply_browser_session(session, browser_cookies)
+                            self.log(
+                                f"{email} 已同步页面会话 cookie {cookie_n} 条（发码接口要求）",
+                                "info",
+                            )
+                        if browser_ua:
+                            account_user_agent = browser_ua
+                        if not castle_token:
+                            self.log(
+                                f"{email} 未拿到 Castle，发码大概率会被服务端静默丢弃",
+                                "warn",
+                            )
+                    elif castle_service.mode not in ("skip", "none", "off", "0", "false"):
                         self.log(
-                            f"{email} Castle mint（Camoufox 无头，mode={castle_service.mode}）…",
+                            f"{email} Castle mint（mode={castle_service.mode}）…",
                             "info",
                         )
                         try:
@@ -3631,17 +3918,6 @@ class RegisterEngine:
                         except Exception as ce:
                             self.log(f"{email} Castle mint 异常: {ce}", "warn")
                             castle_token = None
-                        if castle_token:
-                            self.log(
-                                f"{email} Castle OK len={len(castle_token)} head={castle_token[:28]}…",
-                                "info",
-                            )
-                        else:
-                            self.log(
-                                f"{email} Castle 未拿到（{castle_service.last_error or 'empty'}），"
-                                f"发码/注册将不带或空带 castle",
-                                "warn",
-                            )
                     if self.stop_event.is_set():
                         try:
                             email_service.delete_email(email)
@@ -3650,9 +3926,23 @@ class RegisterEngine:
                         current_email = None
                         return
 
-                    code_ok, code_reason = self.send_email_code_grpc(
-                        session, email, castle_request_token=castle_token
+                    code_ok, code_reason = False, ""
+                    api_res = self.send_email_code_api(
+                        session,
+                        email,
+                        castle_request_token=castle_token,
+                        user_agent=account_user_agent,
                     )
+                    if api_res is None:
+                        self.log(
+                            f"{email} 未找到新发码接口，回退旧 grpc 端点（可能不再发信）",
+                            "warn",
+                        )
+                        code_ok, code_reason = self.send_email_code_grpc(
+                            session, email, castle_request_token=castle_token
+                        )
+                    else:
+                        code_ok, code_reason = api_res
                     if not code_ok:
                         self._fail_account(
                             email_service,
@@ -3687,11 +3977,20 @@ class RegisterEngine:
                         continue
 
                     self.log(f"{email} 邮箱验证码: {verify_code}，提交校验…", "info")
-                    if not self.verify_email_code_grpc(session, email, verify_code):
+                    verify_ok, verify_reason = True, ""
+                    verify_res = self.verify_email_code_api(
+                        session, email, verify_code, user_agent=account_user_agent
+                    )
+                    if verify_res is None:
+                        verify_ok = self.verify_email_code_grpc(session, email, verify_code)
+                        verify_reason = "" if verify_ok else "旧 grpc 校验失败"
+                    else:
+                        verify_ok, verify_reason = verify_res
+                    if not verify_ok:
                         self._fail_account(
                             email_service,
                             email,
-                            f"{email} 邮箱验证码校验失败（码={verify_code}）",
+                            f"{email} 邮箱验证码校验失败（码={verify_code}）：{verify_reason or '未知原因'}",
                         )
                         current_email = None
                         continue
@@ -3765,11 +4064,20 @@ class RegisterEngine:
                                 return
                             continue
 
-                        # 终态前尽量刷新 castle（token 有时效）；失败则复用发码时的
+                        # 默认复用发码时的 Castle（同一浏览器会话，服务端才认）；
+                        # 重新 mint 会换 gb_anon_id/xai_anon_id，反而丢「邮箱已验证」绑定。
                         signup_castle = castle_token
-                        if castle_service.mode not in ("skip", "none", "off", "0", "false"):
+                        if (os.environ.get("GROK_SIGNUP_CASTLE_REFRESH") or "").strip() in (
+                            "1",
+                            "true",
+                            "on",
+                            "yes",
+                        ):
                             try:
-                                fresh = castle_service.mint(stop_event=self.stop_event)
+                                fresh = castle_service.mint(
+                                    stop_event=self.stop_event,
+                                    proxy=self._browser_proxy(),
+                                )
                                 if fresh:
                                     signup_castle = fresh
                                     self.log(
@@ -3783,96 +4091,141 @@ class RegisterEngine:
                                 )
 
                         self.log(f"{email} Turnstile 成功，提交注册（协议）…", "info")
-                        headers = {
-                            "user-agent": account_user_agent,
-                            "accept": "text/x-component",
-                            "content-type": "text/plain;charset=UTF-8",
-                            "origin": self.site_url,
-                            "referer": f"{self.site_url}/sign-up",
-                            "cookie": f"__cf_bm={session.cookies.get('__cf_bm', '')}",
-                            "next-router-state-tree": self.config["state_tree"],
-                            "next-action": final_action_id,
-                        }
-                        body_obj = {
-                            "emailValidationCode": verify_code,
-                            "createUserAndSessionRequest": {
-                                "email": email,
-                                "givenName": generate_random_name(),
-                                "familyName": generate_random_name(),
-                                "clearTextPassword": password,
-                                "tosAcceptedVersion": "$undefined",
-                            },
-                            "turnstileToken": token,
-                            "conversionId": str(uuid.uuid4()),
-                            "promptOnDuplicateEmail": True,
-                        }
-                        if signup_castle:
-                            body_obj["castleRequestToken"] = signup_castle
-                        payload = [body_obj]
-
-                        try:
-                            # 仅起步节流，HTTP 本身并行，避免 8 线程全卡在一把锁上
-                            self._throttle_signup_post()
-                            res = session.post(
-                                f"{self.site_url}/sign-up",
-                                json=payload,
-                                headers=headers,
-                                timeout=15,
-                            )
-                        except Exception as pe:
-                            if self.stop_event.is_set():
-                                return
-                            last_turnstile_err = f"提交注册异常: {pe}"
-                            self.log(f"{email} 提交注册异常: {pe}", "error")
-                            if self._sleep(1):
-                                return
-                            continue
-
-                        if res.status_code != 200:
-                            last_turnstile_err = f"注册 HTTP {res.status_code}: {res.text[:120]}"
-                            self.log(f"{email} {last_turnstile_err}", "warn")
-                            if self._sleep(1):
-                                return
-                            continue
-
-                        body_text = res.text or ""
-                        # 邮箱验证码已用尽 / 失效：再解 Turnstile 也没用，立刻结束本账号
-                        if (
-                            "invalid-validation" in body_text
-                            or "Email validation code is invalid" in body_text
-                            or "email:invalid" in body_text
-                        ):
-                            last_turnstile_err = "邮箱验证码已失效（不可重复注册）"
-                            self.log(
-                                f"{email} 邮箱验证码已失效，停止对本邮箱重试（避免空转）",
-                                "error",
-                            )
-                            break
-
-                        match = re.search(
-                            r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', body_text
+                        # 1) 新 REST 注册端点（2026-10 起）：/api/auth/sign-up/create-account
+                        #    返回 session + redirectUrl，并直接下发 sso；旧 RSC /sign-up
+                        #    现在只会回页面 flight 数据（无 set-cookie）。
+                        api_res = self.signup_create_account_api(
+                            session,
+                            email=email,
+                            password=password,
+                            email_validation_code=verify_code,
+                            turnstile_token=token,
+                            castle_request_token=signup_castle,
+                            user_agent=account_user_agent,
                         )
-                        if not match:
-                            last_turnstile_err = (
-                                f"注册响应无 set-cookie: {body_text[:160]}"
-                            )
-                            self.log(f"{email} {last_turnstile_err}", "warn")
-                            if self._sleep(1):
-                                return
-                            continue
+                        res = None
+                        body_text = ""
+                        if api_res is not None:
+                            api_ok, api_reason, api_data = api_res
+                            if not api_ok:
+                                last_turnstile_err = f"注册被拒：{api_reason}"
+                                self.log(f"{email} {last_turnstile_err}", "warn")
+                                # 验证码/邮箱类错误重试无意义
+                                if any(
+                                    k in (api_reason or "")
+                                    for k in ("验证码", "已注册", "Castle 校验失败")
+                                ):
+                                    break
+                                if self._sleep(1):
+                                    return
+                                continue
+                            # 跟随 cookie-chain 落 sso（部分部署只在 redirectUrl 里下发）
+                            if not session.cookies.get("sso"):
+                                redirect_url = str((api_data or {}).get("redirectUrl") or "")
+                                if redirect_url:
+                                    try:
+                                        session.get(
+                                            redirect_url, allow_redirects=True, timeout=15
+                                        )
+                                    except Exception as re_err:
+                                        self.log(
+                                            f"{email} 跟随 cookie-chain 失败: {re_err}",
+                                            "warn",
+                                        )
+                        else:
+                            headers = {
+                                "user-agent": account_user_agent,
+                                "accept": "text/x-component",
+                                "content-type": "text/plain;charset=UTF-8",
+                                "origin": self.site_url,
+                                "referer": f"{self.site_url}/sign-up",
+                                # 不要手写 cookie 头覆盖 jar：新接口要求沿用发码时的
+                                # gb_anon_id / xai_anon_id / cf_clearance 等会话 cookie
+                                "next-router-state-tree": self.config["state_tree"],
+                                "next-action": final_action_id,
+                            }
+                            body_obj = {
+                                "emailValidationCode": verify_code,
+                                "createUserAndSessionRequest": {
+                                    "email": email,
+                                    "givenName": generate_random_name(),
+                                    "familyName": generate_random_name(),
+                                    "clearTextPassword": password,
+                                    "tosAcceptedVersion": "$undefined",
+                                },
+                                "turnstileToken": token,
+                                "conversionId": str(uuid.uuid4()),
+                                "promptOnDuplicateEmail": True,
+                            }
+                            if signup_castle:
+                                body_obj["castleRequestToken"] = signup_castle
+                            payload = [body_obj]
 
-                        verify_url = match.group(1)
-                        try:
-                            session.get(verify_url, allow_redirects=True, timeout=12)
-                        except Exception:
-                            if self.stop_event.is_set():
-                                # 可能已有 cookie，尽量抢救
-                                sso_try = session.cookies.get("sso")
-                                if sso_try:
-                                    self._emergency_save_sso(
-                                        email, sso_try, "停止时抢救"
-                                    )
-                                return
+                            try:
+                                # 仅起步节流，HTTP 本身并行，避免 8 线程全卡在一把锁上
+                                self._throttle_signup_post()
+                                res = session.post(
+                                    f"{self.site_url}/sign-up",
+                                    json=payload,
+                                    headers=headers,
+                                    timeout=15,
+                                )
+                            except Exception as pe:
+                                if self.stop_event.is_set():
+                                    return
+                                last_turnstile_err = f"提交注册异常: {pe}"
+                                self.log(f"{email} 提交注册异常: {pe}", "error")
+                                if self._sleep(1):
+                                    return
+                                continue
+
+                            if res.status_code != 200:
+                                last_turnstile_err = (
+                                    f"注册 HTTP {res.status_code}: {res.text[:120]}"
+                                )
+                                self.log(f"{email} {last_turnstile_err}", "warn")
+                                if self._sleep(1):
+                                    return
+                                continue
+
+                            body_text = res.text or ""
+                            # 邮箱验证码已用尽 / 失效：再解 Turnstile 也没用，立刻结束本账号
+                            if (
+                                "invalid-validation" in body_text
+                                or "Email validation code is invalid" in body_text
+                                or "email:invalid" in body_text
+                            ):
+                                last_turnstile_err = "邮箱验证码已失效（不可重复注册）"
+                                self.log(
+                                    f"{email} 邮箱验证码已失效，停止对本邮箱重试（避免空转）",
+                                    "error",
+                                )
+                                break
+
+                            match = re.search(
+                                r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', body_text
+                            )
+                            if not match:
+                                last_turnstile_err = (
+                                    f"注册响应无 set-cookie: {body_text[:160]}"
+                                )
+                                self.log(f"{email} {last_turnstile_err}", "warn")
+                                if self._sleep(1):
+                                    return
+                                continue
+
+                            verify_url = match.group(1)
+                            try:
+                                session.get(verify_url, allow_redirects=True, timeout=12)
+                            except Exception:
+                                if self.stop_event.is_set():
+                                    # 可能已有 cookie，尽量抢救
+                                    sso_try = session.cookies.get("sso")
+                                    if sso_try:
+                                        self._emergency_save_sso(
+                                            email, sso_try, "停止时抢救"
+                                        )
+                                    return
                         sso = session.cookies.get("sso")
                         sso_rw = session.cookies.get("sso-rw")
                         if not sso:
@@ -4290,7 +4643,7 @@ engine = RegisterEngine(log_fn=lambda msg, level="info": _cli_logs.emit(msg, lev
 def main():
     print("=" * 60 + "\nGrok 注册机\n" + "=" * 60)
     default_mode = resolve_register_mode()
-    print(f"注册路径: same_session=同会话CLEAN（默认） / protocol=旧混合协议")
+    print(f"注册路径: protocol=协议主路径（默认，REST 发码/验码/注册） / same_session=同会话浏览器")
     print(f"当前默认: {default_mode}（可用环境变量 GROK_REGISTER_MODE 覆盖）")
     mode_in = input(f"\n路径 (默认 {default_mode}): ").strip() or default_mode
     mode = resolve_register_mode(mode_in)

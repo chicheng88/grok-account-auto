@@ -2540,26 +2540,44 @@ def same_session_register(
                 ts_thread.start()
                 out["steps"].append("turnstile_parallel:start")
 
-            # 2) CreateEmailValidationCode —— 页内 fetch（真 Chrome TLS + cookie）
+            # 2) 发码 —— x.ai 2026-10 起改为 REST JSON，且要求 castleRequestToken
+            #    （旧 grpc-web CreateEmailValidationCode 仍回 status 0 但不再发信）
             pc = timing_cfg["pre_code_ms"]
             lo_c, hi_c = int(pc[0]), int(pc[1])
             if hi_c > 0:
                 page.wait_for_timeout(random.randint(max(0, lo_c), max(lo_c, hi_c)))
-            r1 = _page_binary_post(
+            json_headers = {
+                "content-type": "application/json",
+                "accept": "*/*",
+                "accept-language": accept_language,
+            }
+            send_payload = {"email": email}
+            if castle:
+                send_payload["castleRequestToken"] = castle
+            r1 = _page_text_post(
                 page,
-                f"{SITE}/auth_mgmt.AuthManagement/CreateEmailValidationCode",
-                encode_grpc_create_email(email),
-                grpc_headers,
+                f"{SITE}/api/auth/send-verification-code",
+                json.dumps(send_payload),
+                json_headers,
             )
-            out["steps"].append(f"create_code:{r1['status']}")
+            out["steps"].append(f"send_code:{r1['status']}")
             if r1.get("error"):
-                out["error"] = f"CreateEmailValidationCode fetch err: {r1['error']}"
+                out["error"] = f"send-verification-code fetch err: {r1['error']}"
                 return out
             if r1["status"] != 200:
-                # 附带 body 前缀方便排障
-                head = (r1.get("body") or b"")[:120]
                 out["error"] = (
-                    f"CreateEmailValidationCode HTTP {r1['status']} body={head!r}"
+                    f"send-verification-code HTTP {r1['status']} "
+                    f"body={(r1.get('text') or '')[:120]!r}"
+                )
+                return out
+            try:
+                send_data = json.loads(r1.get("text") or "{}")
+            except Exception:
+                send_data = {}
+            if isinstance(send_data, dict) and send_data.get("code"):
+                out["error"] = (
+                    "send-verification-code 被拒: "
+                    f"{send_data.get('code')} {str(send_data.get('error') or '')[:80]}"
                 )
                 return out
             _log(f"发码 ok · {r1['status']}")
@@ -2576,21 +2594,27 @@ def same_session_register(
             out["steps"].append(f"code:{code}")
             _log(f"验证码 {code}")
 
-            # 4) VerifyEmailValidationCode
-            r2 = _page_binary_post(
+            # 4) 验码 —— REST /api/auth/sign-up/verify-email
+            r2 = _page_text_post(
                 page,
-                f"{SITE}/auth_mgmt.AuthManagement/VerifyEmailValidationCode",
-                encode_grpc_verify_email(email, code),
-                grpc_headers,
+                f"{SITE}/api/auth/sign-up/verify-email",
+                json.dumps({"email": email, "code": re.sub(r"\D", "", code)}),
+                json_headers,
             )
             out["steps"].append(f"verify_code:{r2['status']}")
             if r2.get("error"):
-                out["error"] = f"VerifyEmailValidationCode fetch err: {r2['error']}"
+                out["error"] = f"verify-email fetch err: {r2['error']}"
                 return out
-            if r2["status"] != 200:
-                head = (r2.get("body") or b"")[:120]
+            try:
+                verify_data = json.loads(r2.get("text") or "{}")
+            except Exception:
+                verify_data = {}
+            if r2["status"] != 200 or (
+                isinstance(verify_data, dict) and verify_data.get("code")
+            ):
                 out["error"] = (
-                    f"VerifyEmailValidationCode HTTP {r2['status']} body={head!r}"
+                    f"verify-email 被拒: HTTP {r2['status']} "
+                    f"{(r2.get('text') or '')[:120]}"
                 )
                 return out
             _log(f"验码 ok · {r2['status']}")

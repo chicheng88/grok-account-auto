@@ -1,4 +1,4 @@
-﻿"""
+"""
 Turnstile 验证服务
 """
 import os
@@ -163,7 +163,7 @@ class TurnstileService:
     def get_response(
         self,
         task_id,
-        max_retries=80,
+        max_retries=240,
         initial_delay=None,
         retry_delay=None,
         stop_event=None,
@@ -175,6 +175,8 @@ class TurnstileService:
         成功返回 token；失败返回 None（错误在 last_error）。
 
         本地 Solver 默认快轮询：首等 ~0.12s、间隔 ~0.28s（TS_POLL_INITIAL / TS_POLL_INTERVAL）。
+        窗口 ≈ 240 × 0.28 ≈ 67s：Camoufox 解一次通常 15~55s，旧的 80 次（≈23s）
+        会在 Solver 还没出结果时就判超时。
         """
         self.last_error = ""
         if initial_delay is None:

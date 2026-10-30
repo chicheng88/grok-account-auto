@@ -203,6 +203,7 @@ class EmailService:
         if self.freemail_token:
             # cloudflare_temp_email 站点密码
             h["x-custom-auth"] = self.freemail_token
+            #h["x-admin-auth"] = self.freemail_token
             # 兼容部分 freemail 用 Bearer
             if not jwt:
                 h["Authorization"] = f"Bearer {self.freemail_token}"

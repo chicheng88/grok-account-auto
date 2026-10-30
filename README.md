@@ -8,7 +8,7 @@ Web 控制台 + 注册引擎，支持临时邮箱、Turnstile 本地 Solver、Ca
 
 ## 功能
 
-- 纯协议注册路径（grpc-web 发码/验码 + RSC `/sign-up`，默认，不带 Castle token）
+- 纯协议注册路径（REST `/api/auth/*` 发码/验码/建号；发码前用无头浏览器 mint Castle 并同步页面 cookie）
 - 临时邮箱自动建邮 / 收码（[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)），未部署 Worker 时可用手动模式（`MANUAL_EMAIL`）
 - **邮箱后缀多选**：建邮时 round-robin 轮换多个域名
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
@@ -177,10 +177,43 @@ python import_batch_once.py keys/your_sso.txt
 
 | 模式 | 说明 |
 |------|------|
-| `protocol`（默认） | 纯协议路径：grpc-web 发码/验码 + RSC `/sign-up`；发码注册均不携带 Castle token |
-| `same_session` | 同页交互注册（页内发码/验码/signup），需浏览器；`CASTLE_MODE` 默认 `skip` |
+| `protocol`（默认） | 协议主路径：`POST /api/auth/send-verification-code` 发码 → `/api/auth/sign-up/verify-email` 验码 → `/api/auth/sign-up/create-account` 建号；发码前用无头浏览器 mint Castle，并把页面 cookie 同步进 HTTP 会话 |
+| `same_session` | 同页交互注册（页内 castle mint + 页内 fetch），需浏览器；发码/验码已同步新 REST 接口 |
 
-`GROK_REGISTER_MODE` 环境变量可覆盖默认路径；`GROK_CASTLE_MINT=1` / `CASTLE_MODE=camoufox` 可重新开启 Castle mint（新增浏览器耗时，短 token 会被服务端判 invalid_token，默认关闭）。
+`GROK_REGISTER_MODE` 环境变量可覆盖默认路径。
+
+### 2026-10 x.ai 接口迁移（本次修复要点）
+
+x.ai 把认证接口从 grpc-web/RSC 迁到了 REST JSON，**旧端点仍然返回成功但不再真正发信**，
+所以表现为「日志说已发码、邮箱却永远收不到」：
+
+| 动作 | 旧（已失效） | 新（当前使用） |
+|------|--------------|----------------|
+| 发码 | `POST /auth_mgmt.AuthManagement/CreateEmailValidationCode`（grpc-web） | `POST /api/auth/send-verification-code` `{email, castleRequestToken}` |
+| 验码 | `POST /auth_mgmt.AuthManagement/VerifyEmailValidationCode` | `POST /api/auth/sign-up/verify-email` `{email, code}` |
+| 建号 | RSC `POST /sign-up`（next-action） | `POST /api/auth/sign-up/create-account` `{email, password, givenName, familyName, emailValidationCode, turnstileToken, marketingEmailOptIn, castleRequestToken}` |
+
+新发码接口要求 **Castle token 与页面会话 cookie 成对出现**（`gb_anon_id` / `xai_anon_id` /
+`cf_clearance` / `__cf_bm` …），单独带 Castle 不带 cookie 会被判 `account:email-signup-unavailable`
+并静默丢信。因此协议模式现在每号会先起一次无头浏览器：
+
+```
+无头 Chrome（带同一代理，UA 覆盖）→ 打开 /sign-up → 页内 CastleProvider mint
+  → 导出 cookies + UA → 灌进 curl_cffi 会话 → REST 发码/验码/建号
+```
+
+相关开关：
+
+| 配置项 | 说明 | 默认 |
+|--------|------|------|
+| `GROK_SEND_CODE_CASTLE` | `1`=发码前用浏览器 mint Castle（必需）；`0`=关（回到旧 grpc，会收不到信） | `1` |
+| `GROK_SIGNUP_CASTLE_REFRESH` | `1`=建号前重新 mint Castle（会换会话 cookie，一般不需要） | `0` |
+| `GROK_CASTLE_HEADLESS` | `1`=无头浏览器；`0`=有界面（排障用） | `1` |
+| `GROK_CASTLE_MIN_LEN` | Castle token 最短长度（太短服务端判 invalid_token） | `4000` |
+| `TS_POLL_INTERVAL` | Turnstile 轮询间隔；窗口默认 ≈67s（旧 23s 会把 30~55s 的 Solver 误判超时） | `0.28` |
+
+排障命令：`python grok.py` 选 `protocol`、并发 1、数量 1，日志里应依次出现
+`Castle OK … / 已请求邮箱验证码 / 邮箱验证码: xxx-xxx / 已通过 / Turnstile 成功 / 已拿到 SSO`。
 
 ## 手动模式（不依赖邮箱 Worker）
 
@@ -204,7 +237,7 @@ python grok.py          # 路径选 protocol、并发 1、数量 1
 ## 参考与致谢
 
 - [huslx/grokzhuce](https://github.com/huslx/grokzhuce) —— 本项目的主体代码与实现思路源自该仓库（协议还原、Turnstile Solver、注册引擎、Web 控制台）；本仓库在其基础上改动：
-  - 注册路径默认改为纯协议 `protocol`（grpc-web 发码/验码 + RSC `/sign-up`），默认不启用 Castle mint
+  - 注册路径默认改为 `protocol`；2026-10 起跟进 x.ai 的 REST 认证接口（发码/验码/建号）并补上 Castle + 页面 cookie 的同会话要求
   - 新增手动模式（`MANUAL_EMAIL` / `MANUAL_CODE` / `logs\manual_code.txt`），无需邮箱 Worker
   - 本地 Turnstile Solver 默认 `127.0.0.1:5074`，使用页面持久化版 `api_solver_p2.py`
 - [dreamhunter2333/cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email) —— 临时邮箱 Worker

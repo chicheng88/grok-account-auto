@@ -41,11 +41,15 @@ class CastleService:
         self.last_error = ""
         self.last_token = ""
         self.last_meta: dict = {}
+        self.last_cookies: dict = {}
+        self.last_user_agent = ""
 
-    def mint(self, stop_event=None):
+    def mint(self, stop_event=None, proxy=None, user_agent=None):
         self.last_error = ""
         self.last_token = ""
         self.last_meta = {}
+        self.last_cookies = {}
+        self.last_user_agent = ""
         if self.mode in ("skip", "none", "off", "0", "false"):
             self.last_error = "CASTLE_MODE=skip"
             return None
@@ -55,8 +59,11 @@ class CastleService:
         try:
             from .castle_service import mint_castle_from_browser
 
-            r = mint_castle_from_browser()
+            r = mint_castle_from_browser(proxy=proxy, user_agent=user_agent)
             self.last_meta = r if isinstance(r, dict) else {"raw": r}
+            if isinstance(r, dict):
+                self.last_cookies = dict(r.get("cookies") or {})
+                self.last_user_agent = str(r.get("user_agent") or "")
             tok = (r or {}).get("castle") if isinstance(r, dict) else None
             if tok and is_castle_token_usable(tok):
                 self.last_token = tok
