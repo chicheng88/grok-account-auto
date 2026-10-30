@@ -979,6 +979,19 @@ PROXIES = {
 }
 
 
+def _curl_proxies_from_spec(raw: str) -> dict[str, str]:
+    """把一条代理 spec 转成 curl_cffi 的 {http, https} 字典。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = parse_proxy_spec(raw) or {}
+        url = str(parsed.get("server_url") or parsed.get("server") or "").strip()
+        return {"http": url, "https": url} if url else {}
+    except Exception:
+        return {}
+
+
 def _configured_curl_proxies() -> dict[str, str]:
     """Resolve the registration proxy for curl_cffi without using system proxy settings."""
     if PROXIES:
@@ -991,12 +1004,7 @@ def _configured_curl_proxies() -> dict[str, str]:
     if not raw:
         return {}
 
-    try:
-        parsed = parse_proxy_spec(raw) or {}
-        url = str(parsed.get("server_url") or parsed.get("server") or "").strip()
-        return {"http": url, "https": url} if url else {}
-    except Exception:
-        return {}
+    return _curl_proxies_from_spec(raw)
 
 
 def generate_random_name() -> str:
@@ -3183,6 +3191,7 @@ class RegisterEngine:
         impersonate: str,
         user_agent: str,
         skip_token: bool = False,
+        proxy_spec: str = "",
     ) -> None:
         """
         SSO 后后台收尾（enrich 池，不堵注册主路径）：
@@ -3191,8 +3200,12 @@ class RegisterEngine:
         失败不影响成功计数；导入侧可对缺 token 号走兜底。
         """
         try:
-            user_agreement_service = UserAgreementService()
-            nsfw_service = NsfwSettingsService()
+            # 协议 / NSFW 必须与注册同一条代理出口：
+            # 直连往往连不上 grok.com，换出口又容易判异常 —— 这是
+            # 「注册成功、最后 NSFW 这一步失败」的主因。
+            enrich_proxies = _curl_proxies_from_spec(proxy_spec) or _configured_curl_proxies()
+            user_agreement_service = UserAgreementService(proxies=enrich_proxies)
+            nsfw_service = NsfwSettingsService(proxies=enrich_proxies)
             note_parts: list[str] = []
             auth_token = None
 
@@ -3215,41 +3228,65 @@ class RegisterEngine:
 
             unhinged_ok = False
             try:
-                tos_result = user_agreement_service.accept_tos_version(
-                    sso=sso,
-                    sso_rw=sso_rw or "",
-                    impersonate=impersonate,
-                    user_agent=user_agent,
-                )
-                tos_hex = tos_result.get("hex_reply") or ""
-                if not tos_result.get("ok") or not tos_hex:
-                    note_parts.append(
-                        f"协议失败: {tos_result.get('error') or tos_result}"
-                    )
-                else:
-                    nsfw_result = nsfw_service.enable_nsfw(
+                # 1) 同意 TOS（失败不再直接跳过 NSFW：REST 注册时 TOS 可能已接受）
+                tos_ok = False
+                tos_err = ""
+                for _try in range(2):
+                    tos_result = user_agreement_service.accept_tos_version(
                         sso=sso,
                         sso_rw=sso_rw or "",
                         impersonate=impersonate,
                         user_agent=user_agent,
                     )
-                    nsfw_hex = nsfw_result.get("hex_reply") or ""
-                    if not nsfw_result.get("ok") or not nsfw_hex:
-                        note_parts.append(
-                            f"NSFW失败: {nsfw_result.get('error') or nsfw_result}"
+                    if tos_result.get("ok"):
+                        tos_ok = True
+                        break
+                    tos_err = str(tos_result.get("error") or tos_result)
+                    if _try == 0:
+                        time.sleep(0.5)
+                if not tos_ok:
+                    note_parts.append(f"协议失败: {tos_err}")
+                    self.log(f"{email} [后台] 协议失败: {tos_err}", "warn")
+
+                # 2) 开启 NSFW —— 成功与否只认 grpc-status，
+                #    并读回 GetUserFeatureControls 做校验（失败也返回 HTTP 200，
+                #    旧代码「HTTP 200 就算成功」会把没开成的号标成 ✓）。
+                nsfw_ok = False
+                nsfw_err = ""
+                nsfw_detail = ""
+                for _try in range(2):
+                    nsfw_result = nsfw_service.enable_nsfw(
+                        sso=sso,
+                        sso_rw=sso_rw or "",
+                        impersonate=impersonate,
+                        user_agent=user_agent,
+                        retries=0,
+                    )
+                    if nsfw_result.get("ok"):
+                        nsfw_ok = True
+                        nsfw_detail = (
+                            "readback=ok"
+                            if nsfw_result.get("readback_ok")
+                            else "readback=n/a"
                         )
-                    else:
-                        unhinged_result = nsfw_service.enable_unhinged(sso)
-                        unhinged_ok = unhinged_result.get("ok", False)
-                        if not unhinged_ok:
-                            note_parts.append("unhinged失败")
-                        else:
-                            note_parts.append("nsfw=ok")
+                        break
+                    nsfw_err = str(nsfw_result.get("error") or nsfw_result)
+                    if _try == 0:
+                        time.sleep(0.5)
+
+                if nsfw_ok:
+                    note_parts.append(f"nsfw=ok({nsfw_detail})" if nsfw_detail else "nsfw=ok")
+                    if not tos_ok:
+                        note_parts.append("协议未确认")
+                else:
+                    note_parts.append(f"NSFW失败: {nsfw_err}")
+                    self.log(f"{email} [后台] NSFW 失败: {nsfw_err}", "warn")
+                unhinged_ok = nsfw_ok
             except Exception as post_err:
                 note_parts.append(f"协议/NSFW异常: {post_err}")
                 self.log(f"{email} [后台] 协议/NSFW 异常: {post_err}", "warn")
 
-            note = "; ".join(str(x)[:80] for x in note_parts)
+            note = "; ".join(str(x)[:100] for x in note_parts)
             # token 已在 _exchange_token_after_clean 里写过；这里再合并 note/nsfw
             self._update_success_meta(
                 success_id,
@@ -3258,7 +3295,7 @@ class RegisterEngine:
                 note=note,
             )
             if unhinged_ok:
-                self.log(f"{email} [后台] NSFW/unhinged 已开", "success")
+                self.log(f"{email} [后台] NSFW 已开（grpc-status 0）", "success")
         except Exception as e:
             self.log(f"{email} [后台] enrich 异常: {e}", "warn")
         finally:
@@ -3275,6 +3312,7 @@ class RegisterEngine:
         impersonate: str,
         user_agent: str,
         skip_token: bool = False,
+        proxy_spec: str = "",
     ) -> None:
         with self._enrich_lock:
             self._enrich_pending += 1
@@ -3287,6 +3325,7 @@ class RegisterEngine:
                 success_id=success_id,
                 impersonate=impersonate,
                 user_agent=user_agent,
+                proxy_spec=proxy_spec,
                 skip_token=skip_token,
             )
         except Exception as e:
@@ -4273,6 +4312,8 @@ class RegisterEngine:
                                 success_id=sid,
                                 impersonate=impersonate_fingerprint,
                                 user_agent=account_user_agent,
+                                # 协议/NSFW 沿用本号出口，避免换 IP 被判异常
+                                proxy_spec=proxy_spec_str,
                             )
                         # SSO 已在盘上：无论是否计入目标，都算本邮箱完成
                         current_email = None

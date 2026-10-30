@@ -14,8 +14,14 @@ DEFAULT_USER_AGENT = (
 class UserAgreementService:
     """处理账号协议同意流程（线程安全，无全局状态）。"""
 
-    def __init__(self, cf_clearance: str = ""):
+    def __init__(
+        self,
+        cf_clearance: str = "",
+        proxies: Optional[Dict[str, str]] = None,
+    ):
         self.cf_clearance = (cf_clearance or "").strip()
+        # 与注册同出口：直连常常连不上 / 被风控（换 IP 也会被判异常）
+        self.proxies: Dict[str, str] = dict(proxies or {})
 
     def accept_tos_version(
         self,
@@ -25,6 +31,7 @@ class UserAgreementService:
         user_agent: Optional[str] = None,
         cf_clearance: Optional[str] = None,
         timeout: int = 15,
+        proxies: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         同意 TOS 版本。
@@ -85,24 +92,28 @@ class UserAgreementService:
                 data=data,
                 impersonate=impersonate or "chrome120",
                 timeout=timeout,
+                proxies=proxies if proxies is not None else self.proxies,
             )
             hex_reply = response.content.hex()
             grpc_status = response.headers.get("grpc-status")
+            grpc_message = (response.headers.get("grpc-message") or "").replace("%20", " ").strip()
 
             error = None
             ok = response.status_code == 200 and (grpc_status in (None, "0"))
             if response.status_code == 403:
-                error = "403 Forbidden"
+                error = "403 Forbidden（Cloudflare 拦截/出口被风控）"
             elif response.status_code != 200:
                 error = f"HTTP {response.status_code}"
             elif grpc_status not in (None, "0"):
-                error = f"gRPC {grpc_status}"
+                # 这些 RPC 失败也回 HTTP 200，真实原因只在 grpc-message 里
+                error = f"gRPC {grpc_status}" + (f": {grpc_message}" if grpc_message else "")
 
             return {
                 "ok": ok,
                 "hex_reply": hex_reply,
                 "status_code": response.status_code,
                 "grpc_status": grpc_status,
+                "grpc_message": grpc_message,
                 "error": error,
             }
         except Exception as e:

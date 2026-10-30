@@ -1073,7 +1073,13 @@ def _normalize_flight_text(text: str) -> str:
 
 def _extract_set_cookie_urls(text: str) -> list[str]:
     """
-    从 Next.js RSC / flight 响应抠 **完整** set-cookie 链接。
+    从 Next.js RSC / flight 响应抠 **完整** 登录 cookie 链接。
+
+    2026-10 起 x.ai 改版：signup 响应不再给 `…/set-cookie?q=…`，
+    而是给 **一条** `https://accounts.x.ai/cookie-chain?q=<jwt>`，
+    由它 302 串完 auth.x.ai / grok.com / auth.cursor.com 等各跳并下发 cookie。
+    只认 set-cookie 会让"注册成功"的响应被判成"无 set-cookie"，
+    随后重试又把验证码烧掉 → 表现为注册到最后一步必失败。
 
     关键：链接在 `18:T9d5,<url>` 这种 text chunk 里，长度常 >2500，
     旧正则/截断会得到残缺 JWT → 跟跳 400/auth-error，永远没 sso。
@@ -1082,10 +1088,18 @@ def _extract_set_cookie_urls(text: str) -> list[str]:
     raw = _normalize_flight_text(text)
     cleaned: list[str] = []
 
-    def _push(u: str) -> None:
-        u = (u or "").strip().rstrip("\\").rstrip('"').rstrip("'").rstrip("1:")
-        u = re.sub(r"[\r\n].*$", "", u)
-        if "set-cookie?q=" not in u:
+    def _is_cookie_link(u: str) -> bool:
+        return "set-cookie?q=" in u or "cookie-chain?q=" in u
+
+    def _push(u: str, *, exact: bool = False) -> None:
+        u = (u or "").strip()
+        if not exact:
+            u = u.rstrip("\\").rstrip('"').rstrip("'")
+            u = re.sub(r"[\r\n].*$", "", u)
+            # 去掉 flight 尾巴（如 `1:"$3c"`）；不要再 rstrip("1:")
+            # 否则会啃掉 base64url 结尾的合法字符
+            u = re.split(r'["\s]', u)[0]
+        if not _is_cookie_link(u):
             return
         if not u.startswith("http"):
             return
@@ -1101,29 +1115,28 @@ def _extract_set_cookie_urls(text: str) -> list[str]:
         if ln <= 0 or ln > 200_000:
             continue
         chunk = raw[m.end() : m.end() + ln]
-        if "set-cookie?q=" not in chunk:
+        if not _is_cookie_link(chunk):
             continue
-        # chunk 本身就是完整 URL
+        # chunk 本身就是完整 URL（长度精确，不能再裁剪）
         if chunk.startswith("http"):
-            _push(chunk.strip())
+            _push(chunk, exact=True)
         else:
             for u in re.findall(
-                r"https://[A-Za-z0-9.-]+/set-cookie\?q=[A-Za-z0-9_\-\.]+",
+                r"https://[A-Za-z0-9.-]+/(?:set-cookie|cookie-chain)\?q=[A-Za-z0-9_\-\.]+",
                 chunk,
             ):
                 _push(u)
-
     # 2) 兜底：非精确 T 块 / 全文
     if not cleaned:
         for m in re.finditer(
             r"\d+:T[0-9a-fA-F]+,(.+?)(?=\n\d+:|\Z)", raw, re.S
         ):
             chunk = (m.group(1) or "").strip()
-            if "set-cookie?q=" in chunk and chunk.startswith("http"):
+            if _is_cookie_link(chunk) and chunk.startswith("http"):
                 _push(chunk.split()[0] if chunk.split() else chunk)
     if not cleaned:
         for u in re.findall(
-            r"https://[A-Za-z0-9.-]+/set-cookie\?q=[A-Za-z0-9_\-\.]+",
+            r"https://[A-Za-z0-9.-]+/(?:set-cookie|cookie-chain)\?q=[A-Za-z0-9_\-\.]+",
             raw,
         ):
             _push(u)
@@ -1131,6 +1144,35 @@ def _extract_set_cookie_urls(text: str) -> list[str]:
     # 最长优先（完整链入口在最外层，q 最长）
     cleaned.sort(key=len, reverse=True)
     return cleaned
+
+
+def _cookie_chain_hops(url: str) -> list[str]:
+    """
+    解析 `…/cookie-chain?q=<jwt>` 里的 hops[]（各站 set-cookie 入口）。
+
+    2026-10 起登录链是「一条 cookie-chain + 多个 hop」：
+      auth.x.ai/set-cookie → auth.grokusercontent.com → auth.grok.com → auth.cursor.com
+    每个 hop 只对**发起注册的同一浏览器会话**（anon cookie 绑定）下发 cookie，
+    独立 curl 会 400。所以必须由同一个 page 依次访问。
+    """
+    try:
+        from urllib.parse import parse_qs, urlparse
+
+        q = parse_qs(urlparse(url).query).get("q", [""])[0]
+        if not q or q.count(".") < 2:
+            return []
+        pad = "=" * ((4 - len(q.split(".")[1]) % 4) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(q.split(".")[1] + pad).decode("utf-8", "ignore")
+        )
+        hops: list[str] = []
+        for h in (payload or {}).get("hops") or []:
+            href = str((h or {}).get("href") or "").strip()
+            if href.startswith("http") and href not in hops:
+                hops.append(href)
+        return hops
+    except Exception:
+        return []
 
 
 def _expand_set_cookie_chain(url: str, max_depth: int = 8) -> list[str]:
@@ -2248,11 +2290,25 @@ def same_session_register(
 
             nav_timeout = min(90000, max(30000, int(timeout_s) * 1000))
             t_goto = time.time()
-            page.goto(
-                f"{SITE}/sign-up",
-                wait_until="domcontentloaded",
-                timeout=nav_timeout,
-            )
+            # 代理出口偶发慢/超时：重试一次，避免整个邮箱因为一次 goto 超时被废掉
+            try:
+                page.goto(
+                    f"{SITE}/sign-up",
+                    wait_until="domcontentloaded",
+                    timeout=nav_timeout,
+                )
+            except Exception as goto_err:
+                _log(f"sign-up 首跳失败，重试一次 · {_compact_log(goto_err, 80)}")
+                out["steps"].append(f"goto_retry:{type(goto_err).__name__}")
+                try:
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    time.sleep(1.2)
+                page.goto(
+                    f"{SITE}/sign-up",
+                    wait_until="domcontentloaded",
+                    timeout=nav_timeout,
+                )
             _log(f"sign-up 就绪 · {time.time()-t_goto:.1f}s")
             # networkidle 太长会空烧；fast 默认 5s，可用 env 覆盖
             ni_ms = int(timing_cfg.get("networkidle_ms") or 5000)
@@ -2621,8 +2677,14 @@ def same_session_register(
 
             # 5) 收 Turnstile：优先吃并行结果；并行已好则不再空等
             if ts_thread is not None:
-                # 邮箱快时 solver 可能还没完；最多再等 90s
-                remain = max(1.0, 90.0 - (time.time() - (ts_holder.get("t0") or time.time())))
+                # 邮箱快时 solver 可能还没完；默认最多再等 150s
+                # （慢代理下 CF 挑战 60~120s 常见，90s 会白白废掉一个已验证邮箱）
+                try:
+                    ts_wait = float(os.getenv("GROK_TS_WAIT_SEC") or "150")
+                except ValueError:
+                    ts_wait = 150.0
+                ts_wait = max(30.0, min(ts_wait, 400.0))
+                remain = max(1.0, ts_wait - (time.time() - (ts_holder.get("t0") or time.time())))
                 ts_thread.join(timeout=remain)
                 if ts_thread.is_alive():
                     out["error"] = "turnstile parallel timeout"
@@ -2861,11 +2923,24 @@ def same_session_register(
                 # #14：200 + RSC digest / 空业务响 → 重试
                 digest_m = re.search(r'"digest"\s*:\s*"(\d+)"', text)
                 digest_note = f" digest={digest_m.group(1)}" if digest_m else ""
+                # RSC 里真正的业务错误（body 很长，前 240 字符看不到）
+                # 注意跳过 `$undefined` 这类 flight 引用占位
+                err_m = re.search(r'"error"\s*:\s*"([^"]{0,240})"', text or "")
+                biz_err = err_m.group(1).strip() if err_m else ""
+                if biz_err.startswith("$"):
+                    biz_err = ""
                 out["steps"].append(f"signup_no_setcookie:try{s_try}")
                 _log(
                     f"signup {st} 无 set-cookie · try#{s_try}/{max_signup_tries}"
-                    f"{digest_note} · 刷新 action 后重试"
+                    f"{digest_note}"
+                    + (f" · 业务错误={biz_err}" if biz_err else " · 无业务错误(疑似 action 过期)")
                 )
+                # 有明确业务错误时重试没意义，而且验证码已被消耗：
+                # 继续重试只会得到 email:invalid-validation-code，白烧一个邮箱。
+                if biz_err:
+                    out["error"] = f"signup 被拒: {biz_err}"
+                    out["steps"].append("signup_biz_error")
+                    return out
                 if s_try >= max_signup_tries:
                     out["error"] = (
                         f"signup {st} 但 body 无 set-cookie URL "
@@ -2929,7 +3004,28 @@ def same_session_register(
                     _log(f"cookie 链完成 · jar 直取 · {short_hosts}")
                     return s1, s2 or s1
 
-                # --- 主路径：context.request 共享 cookie 罐 ---
+                # --- 新版 cookie-chain：必须真·浏览器导航，且要抢在 token 被消耗前 ---
+                # 用 ctx.request 先打一发会被 CF 403，而且这个 q 是一次性的：
+                # 先打非浏览器请求 = 把链烧掉，后面 goto/hops 全 400。
+                if "cookie-chain?q=" in entry and _page_alive():
+                    out["steps"].append(f"{tag}:chain_goto_first")
+                    try:
+                        page.goto(entry, wait_until="domcontentloaded", timeout=45000)
+                        out["steps"].append(f"{tag}:chain_goto_ok")
+                    except Exception as e_cg:
+                        out["steps"].append(f"{tag}:chain_goto_err:{type(e_cg).__name__}")
+                        _log(f"cookie-chain 导航失败 · {_compact_log(e_cg, 80)}")
+                    # 链页会用 JS 依次走 hop 并落 cookie：多等一会儿
+                    for _ in range(40):
+                        s1, s2 = _read_sso_jar()
+                        if s1:
+                            out["steps"].append(f"{tag}:chain_goto_jar")
+                            _log(f"cookie 链完成 · chain 导航 · sso={len(s1)}")
+                            return s1, s2 or s1
+                        _safe_page_wait(300)
+                    out["steps"].append(f"{tag}:chain_goto_no_sso")
+
+                # --- 旧路径：context.request 共享 cookie 罐 ---
                 req_status: Any = None
                 closed_mid = False
                 try:
@@ -3012,6 +3108,34 @@ def same_session_register(
                         _log(f"cookie 链完成 · page.goto · {short_hosts}")
                         return s1, s2 or s1
                     _safe_page_wait(300)
+
+                # --- cookie-chain 的 hops：必须由同一浏览器会话逐个访问 ---
+                hops = _cookie_chain_hops(entry)
+                if hops:
+                    out["steps"].append(f"{tag}:hops:{len(hops)}")
+                    _log(f"cookie 链未落 sso · 逐个访问 {len(hops)} 个 hop")
+                    for hi, hop in enumerate(hops[:8]):
+                        s1, _ = _read_sso_jar()
+                        if s1 or not _page_alive():
+                            break
+                        try:
+                            page.goto(hop, wait_until="commit", timeout=25000)
+                            out["steps"].append(f"{tag}:hop{hi}")
+                        except Exception as e_hop:
+                            out["steps"].append(
+                                f"{tag}:hop{hi}_err:{type(e_hop).__name__}"
+                            )
+                            continue
+                        for _ in range(10):
+                            s1, _ = _read_sso_jar()
+                            if s1:
+                                break
+                            _safe_page_wait(200)
+                    s1, s2 = _read_sso_jar()
+                    if s1:
+                        out["steps"].append(f"{tag}:hops_ok")
+                        _log(f"cookie 链完成 · hops · sso={len(s1)}")
+                        return s1, s2 or s1
 
                 try:
                     out["cookie_names"] = [
