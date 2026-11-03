@@ -1393,6 +1393,153 @@ def token_to_auth_entry(token: dict, email: str = "") -> dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------ #
+# token 落盘：keys/token.txt（一行一个 JSON，test_grok45.py 可直接读）
+# 目的：把 device flow 换到的 access_token / refresh_token 持久化，
+#       进程重启后不必再用 sso 重换；也是「注册成功但 enrich 没跑完」的兜底。
+# ------------------------------------------------------------------ #
+_TOKEN_FILE_LOCK = threading.Lock()
+_TOKEN_FILE_SEEN: dict[str, set[str]] = {}
+
+
+def token_file_path() -> Path:
+    """token 落盘路径：GROK_TOKEN_FILE 覆盖（相对路径按仓库根算），默认 keys/token.txt。"""
+    raw = (os.environ.get("GROK_TOKEN_FILE") or "").strip()
+    if not raw:
+        return _BASE_DIR / "keys" / "token.txt"
+    p = Path(raw)
+    return p if p.is_absolute() else (_BASE_DIR / p)
+
+
+def _token_record_key(rec: dict) -> str:
+    return f"{rec.get('email') or ''}|{rec.get('access_token') or ''}"
+
+
+def _token_seen_for(path: Path) -> set[str]:
+    """进程内缓存已落盘的 (email, at) 集合，首次调用时扫一遍文件。"""
+    key = str(path)
+    seen = _TOKEN_FILE_SEEN.get(key)
+    if seen is not None:
+        return seen
+    seen = set()
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(rec, dict):
+                        seen.add(_token_record_key(rec))
+    except Exception:
+        pass
+    _TOKEN_FILE_SEEN[key] = seen
+    return seen
+
+
+def build_token_record(
+    email: str,
+    token: dict,
+    *,
+    sso: str = "",
+    note: str = "",
+) -> dict:
+    """把 device flow 原始 token 整理成落盘记录（保留 rt / id_token）。"""
+    t = token or {}
+    access = str(t.get("access_token") or t.get("key") or "")
+    payload = decode_jwt_payload(access) if access else {}
+    expires_at = ""
+    if payload.get("exp"):
+        try:
+            expires_at = _rfc3339_ns(float(payload["exp"]))
+        except Exception:
+            expires_at = ""
+    if not expires_at:
+        try:
+            expires_at = _rfc3339_ns(time.time() + float(t.get("expires_in") or 21600))
+        except Exception:
+            expires_at = ""
+    rec = {
+        "email": email or str(t.get("email") or "") or str(payload.get("email") or ""),
+        "access_token": access,
+        "refresh_token": str(t.get("refresh_token") or ""),
+        "id_token": str(t.get("id_token") or ""),
+        "token_type": str(t.get("token_type") or "Bearer"),
+        "scope": str(t.get("scope") or ""),
+        "expires_at": expires_at,
+        "user_id": str(payload.get("sub") or payload.get("principal_id") or ""),
+        "oidc_issuer": OIDC_ISSUER,
+        "oidc_client_id": GROK_CLI_CLIENT_ID,
+        "sso": sso or "",
+        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    if note:
+        rec["note"] = note
+    return rec
+
+
+def append_token_record(
+    email: str,
+    token: dict,
+    *,
+    sso: str = "",
+    note: str = "",
+) -> str:
+    """
+    追加一行 token JSON；同一 (email, access_token) 只写一次。
+    返回写入路径（去重命中时也返回路径），失败返回空串。绝不抛异常。
+    """
+    try:
+        if not isinstance(token, dict):
+            return ""
+        rec = build_token_record(email, token, sso=sso, note=note)
+        if not rec.get("access_token"):
+            return ""
+        path = token_file_path()
+        with _TOKEN_FILE_LOCK:
+            seen = _token_seen_for(path)
+            k = _token_record_key(rec)
+            if k in seen:
+                return str(path)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                seen.add(k)
+            except Exception:
+                return ""
+        return str(path)
+    except Exception:
+        return ""
+
+
+def load_token_records() -> list[dict]:
+    """读回 keys/token.txt（一行一个 JSON），损坏行自动跳过。"""
+    out: list[dict] = []
+    path = token_file_path()
+    try:
+        if not path.exists():
+            return out
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict) and rec.get("access_token"):
+                    out.append(rec)
+    except Exception:
+        return out
+    return out
+
+
 def sso_device_flow_to_token(
     sso: str,
     *,
@@ -2790,6 +2937,10 @@ class RegisterEngine:
             cached_token = None
             if isinstance(auth_token, dict) and is_auth_token_usable(auth_token):
                 cached_token = dict(auth_token)
+                # 注册链路自己换到的票（protocol 模式）也落盘，别只留在内存
+                tok_path = append_token_record(email, cached_token, sso=sso, note="register")
+                if tok_path:
+                    self.log(f"{email} token 已落盘（at+rt）: {tok_path}", "info")
             success_id = f"{int(time.time() * 1000)}_{self.success_count}"
             self.recent_success.appendleft(
                 {
@@ -3133,6 +3284,9 @@ class RegisterEngine:
             if check.get("ok") and isinstance(check.get("token"), dict):
                 token = check.get("token")
                 if is_auth_token_usable(token):
+                    tok_path = append_token_record(email, token, sso=sso, note="enrich")
+                    if tok_path:
+                        self.log(f"{email} {tag}token 已落盘（at+rt）: {tok_path}", "info")
                     self._update_success_meta(
                         success_id,
                         auth_token=token,

@@ -1536,6 +1536,7 @@ def import_sso_to_upstream(
         sso_device_flow_to_token,
         token_to_auth_entry,
         is_auth_token_usable,
+        append_token_record,
         _device_flow_error_kind,
         _device_flow_wait_seconds,
         _mark_device_flow_cooldown,
@@ -1930,6 +1931,10 @@ def import_sso_to_upstream(
                 continue
             try:
                 entry = token_to_auth_entry(flow["token"], email=email_hint or "")
+                # 兜底换到的票也落盘，避免下次重启又要重换
+                append_token_record(
+                    email_hint or "", flow["token"], sso=sso, note="import_fallback"
+                )
                 item = _write_token_to_sub2api(entry, email_hint or "", idx)
                 item["sso_hint"] = sso_hint
                 item["via"] = "device_flow_http"
